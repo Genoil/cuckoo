@@ -110,12 +110,9 @@ public:
   __device__ void set(node_t u) {
 	  node_t idx = u / 16;
 	  u32 bit = 1 << (2 * (u % 16));
-	  //u32 old = atomicOr(&bits[idx], bit); // ~1% slower than 2 lines below
-	  u32 old = bits[idx];
-	  bits[idx] |= bit;
-	  //
+	  u32 old = atomicOr(&bits[idx], bit);
 	  u32 bit2 = bit << 1;
-	  if ((old & (bit2 | bit)) == bit) atomicOr(&bits[idx], bit2); //somehow this is faster
+	  if ((old & (bit2 | bit)) == bit) atomicOr(&bits[idx], bit2); 
   } 
   __device__ u32 test(node_t u) const {
     return (bits[u/16] >> (2 * (u%16))) & 2;
