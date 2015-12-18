@@ -189,7 +189,7 @@ public:
 
 __global__ void
 __launch_bounds__(TPB, 1)
-count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
+count_node_deg(cuckoo_ctx *ctx, u32 uorv) {
   shrinkingset &alive = ctx->alive;
   twice_set &nonleaf = ctx->nonleaf;
 
@@ -203,20 +203,26 @@ count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
     u32 alive32 = alive.block(block);
 
-    for (nonce_t nonce = block; alive32; alive32>>=1, nonce++) {
-      if (alive32 & 1) {
-		  node_t u = dipnode(&sip_ctx, nonce, uorv);
-        if ((u & PART_MASK) == part) {
-          nonleaf.set(u >> PART_BITS);
-        }
-      }
-    }
+	nonce_t nonce = block;
+
+	u32 f = __ffs(alive32) - 1;
+	alive32 >>= f;
+	nonce += f;
+
+	while (alive32){
+		node_t u = dipnode(&sip_ctx, nonce, uorv);
+		nonleaf.set(u);
+
+		u32 f = __ffs(alive32 & (UINT_MAX - 1)) - 1;
+		alive32 >>= f;
+		nonce += f;
+	}
   }
 }
 
 __global__ void
 __launch_bounds__(TPB, 1)
-kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
+kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv) {
   shrinkingset &alive = ctx->alive;
   twice_set &nonleaf = ctx->nonleaf;
   
@@ -228,16 +234,27 @@ kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
   for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
     u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block; alive32; alive32>>=1, nonce++) {
-      if (alive32 & 1) {
-		node_t u = dipnode(&sip_ctx, nonce, uorv);
-        if ((u & PART_MASK) == part) {
-          if (!nonleaf.test(u >> PART_BITS)) {
-            alive.reset(nonce);
-          }
-        }
-      }
-    }
+
+	nonce_t nonce = block;
+
+	u32 f = __ffs(alive32) - 1;
+	alive32 >>= f;
+	nonce += f;
+
+	while (alive32) {
+		if (alive32 & 1) {
+			node_t u = dipnode(&sip_ctx, nonce, uorv);
+			if ((u & PART_MASK) == 0) {
+				if (!nonleaf.test(u >> PART_BITS)) {
+					alive.reset(nonce);
+				}
+			}
+		}
+
+		u32 f = __ffs(alive32 & (UINT_MAX - 1)) - 1;
+		alive32 >>= f; 
+		nonce += f;
+	}
   }
 }
 
@@ -316,12 +333,12 @@ int main(int argc, char **argv) {
 
   for (u32 round=0; round < ntrims; round++) {
     for (u32 uorv = 0; uorv < 2; uorv++) {
-      for (u32 part = 0; part <= PART_MASK; part++) {
+      //for (u32 part = 0; part <= PART_MASK; part++) {
         checkCudaErrors(cudaMemset(ctx.nonleaf.bits, 0, nodeBytes));
-		count_node_deg << <nthreads / TPB, TPB >> >(device_ctx, uorv, part);
-		kill_leaf_edges << <nthreads / TPB, TPB >> >(device_ctx, uorv, part);
+		count_node_deg << <nthreads / TPB, TPB >> >(device_ctx, uorv);
+		kill_leaf_edges << <nthreads / TPB, TPB >> >(device_ctx, uorv);
 		cudaDeviceSynchronize();
-      }
+      //}
     }
   }
   if (profiling) {
