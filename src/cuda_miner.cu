@@ -258,6 +258,90 @@ kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv) {
   }
 }
 
+#define ERR_MAX_PATH_LENGTH_EXCEEDED 1
+#define ERR_ILLEGAL_CYCLE 2
+
+__device__ u32 path(cuckoo_hash * cuckoo, node_t u, node_t *us, int * err) {
+	u32 nu;
+	for (nu = 0; u; u = cuckoo->node(u)) {
+		if (++nu >= MAXPATHLEN) {
+			while (nu-- && us[nu] != u);
+			if (nu == ~0) {
+				*err = ERR_MAX_PATH_LENGTH_EXCEEDED;
+				return nu;
+			}
+			else {
+				*err = ERR_ILLEGAL_CYCLE;
+				return MAXPATHLEN - nu;
+			}
+		}
+		us[nu] = u;
+	}
+	return nu;
+}
+
+//__launch_bounds__(TPB, 1)
+__global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * us, node_t * vs, cycle_t * found_cycles, nonce_t * solution) {
+	node_t gid = 32 * (blockIdx.x * blockDim.x + threadIdx.x);
+	u32 cycles_found = 0;
+	u32 bits = ctx->alive.block(gid);
+	for (nonce_t nonce = gid; nonce < gid + 32; nonce++) {
+		if (!(bits >> (nonce % 32) & 1)) {
+			node_t u0 = dipnode(&ctx->sip_ctx, nonce, 0), v0 = dipnode(&ctx->sip_ctx, nonce, 1);
+			if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
+				continue;
+			node_t u = cuckoo->node(us[0] = u0), v = cuckoo->node(vs[0] = v0);
+			int err = 0;
+			u32 nu = path(cuckoo, u, us, &err), nv = path(cuckoo, v, vs, &err);
+			if (err != 0) {
+				return;
+			}
+			if (us[nu] == vs[nv]) {
+				u32 min = nu < nv ? nu : nv;
+				for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++);
+				u32 len = nu + nv + 1;
+
+				found_cycles[cycles_found].len = len;
+				found_cycles[cycles_found].nonce = nonce;
+				cycles_found++;
+				/*
+				if(len == PROOFSIZE) {
+				std::set<edge> cycle;
+				u32 n;
+				cycle.insert(edge(*us, *vs));
+				while (nu--)
+				cycle.insert(edge(us[(nu + 1)&~1], us[nu | 1])); // u's in even position; v's in odd
+				while (nv--)
+				cycle.insert(edge(vs[nv | 1], vs[(nv + 1)&~1])); // u's in odd position; v's in even
+				for (nonce_t nce = n = 0; nce < HALFSIZE; nce++)
+				if (!(bits[nce / 32] >> (nce % 32) & 1)) {
+				edge e(sipnode(&ctx->sip_ctx, nce, 0), sipnode(&ctx->sip_ctx, nce, 1));
+				if (cycle.find(e) != cycle.end()) {
+				solution[n] = nonce;
+				if (PROOFSIZE > 2)
+				cycle.erase(e);
+				n++;
+				}
+				}
+				assert(n == PROOFSIZE);
+				}
+				*/
+				continue;
+			}
+			if (nu < nv) {
+				while (nu--)
+					cuckoo->dset(us[nu + 1], us[nu]);
+				cuckoo->dset(u0, v0);
+			}
+			else {
+				while (nv--)
+					cuckoo->dset(vs[nv + 1], vs[nv]);
+				cuckoo->dset(v0, u0);
+			}
+		}
+	}
+}
+
 u32 path(cuckoo_hash &cuckoo, node_t u, node_t *us) {
   u32 nu;
   for (nu = 0; u; u = cuckoo[u]) {
@@ -371,6 +455,43 @@ int main(int argc, char **argv) {
 
   cuckoo_hash &cuckoo = *(new cuckoo_hash());
   node_t us[MAXPATHLEN], vs[MAXPATHLEN];
+
+#ifdef FINDPATH_GPU
+  u32 cuckooBytes = CUCKOO_SIZE * sizeof(u64);
+  checkCudaErrors(cudaMalloc((void**)&cuckoo.cuckoo, cuckooBytes));
+  checkCudaErrors(cudaMemset(cuckoo.cuckoo, 0, cuckooBytes));
+  cuckoo_hash *device_cuckoo;
+  checkCudaErrors(cudaMalloc((void**)&device_cuckoo, sizeof(cuckoo_hash)));
+  cudaMemcpy(device_cuckoo, &cuckoo, sizeof(cuckoo_hash), cudaMemcpyHostToDevice);
+
+
+
+
+  u32 pathBytes = MAXPATHLEN * sizeof(node_t);
+  checkCudaErrors(cudaMalloc((void**)&us, pathBytes));
+  checkCudaErrors(cudaMalloc((void**)&vs, pathBytes));
+  //checkCudaErrors(cudaMemset((void *)us, 0, pathBytes));
+  //checkCudaErrors(cudaMemset((void *)vs, 0, pathBytes));
+
+  cycle_t cycle_buffer[MAXFOUNDCYCLES];
+  checkCudaErrors(cudaMalloc((void**)&cycle_buffer, sizeof(cycle_t) * MAXFOUNDCYCLES));
+  //checkCudaErrors(cudaMemset(found_cycles, 0, sizeof(cycle_t) * MAXFOUNDCYCLES));
+
+  nonce_t solution[PROOFSIZE];
+  checkCudaErrors(cudaMalloc((void**)&solution, sizeof(nonce_t) * PROOFSIZE));
+  //checkCudaErrors(cudaMemset(solution, 0, sizeof(nonce_t) * PROOFSIZE));
+
+  find_cycles << <(HALFSIZE / 32) / TPB, TPB >> >(device_ctx, device_cuckoo, us, vs, cycle_buffer, solution);
+  cycle_t found_cycles[MAXFOUNDCYCLES];
+  cudaMemcpy(found_cycles, found_cycles, sizeof(cycle_t) * MAXFOUNDCYCLES, cudaMemcpyDeviceToHost);
+  for (int i = 0; i < MAXFOUNDCYCLES; i++) {
+	  if (found_cycles[i].len > 0) {
+		  printf("% 4d-cycle found at %d:%d%%\n", found_cycles[i].len, 0, (u32)(found_cycles[i].nonce * 100L / HALFSIZE));
+	  }
+  }
+
+#else 
+
   for (nonce_t block = 0; block < HALFSIZE; block += 32) {
     for (nonce_t nonce = block; nonce < block+32 && nonce < HALFSIZE; nonce++) {
       if (!(bits[nonce/32] >> (nonce%32) & 1)) {
@@ -420,5 +541,7 @@ int main(int argc, char **argv) {
       }
     }
   }
+#endif
+
   return 0;
 }
