@@ -397,7 +397,7 @@ int main(int argc, char **argv) {
               if (!(bits[nce/32] >> (nce%32) & 1)) {
                 edge e(sipnode(&ctx.sip_ctx, nce, 0), sipnode(&ctx.sip_ctx, nce, 1));
                 if (cycle.find(e) != cycle.end()) {
-                  printf(" %lx", nonce);
+                  printf(" %lx", nce);
                   if (PROOFSIZE > 2)
                     cycle.erase(e);
                   n++;
