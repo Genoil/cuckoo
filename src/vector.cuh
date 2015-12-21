@@ -78,7 +78,7 @@ static __device__ __forceinline__ uint2 operator- (uint2 a, uint2 b)
 	return result;
 }
 
-static __device__ __forceinline__ void operator+= (uint2 &a, uint2 b) { a = a + b; }
+ static __device__ __forceinline__ void operator+= (uint2 &a, uint2 b) { a = a + b; }
 
 #if  __CUDA_ARCH__ >= 350
 __inline__ __device__ uint2 ROL2(const uint2 a, const int offset) {

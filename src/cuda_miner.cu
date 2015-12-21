@@ -13,6 +13,12 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+// used for writing graph to disk for debugging findpath
+#include <iostream>
+#include <fstream>
+
+using namespace std;
+
 #if SIZESHIFT <= 32
 typedef u32 nonce_t;
 typedef u32 node_t;
@@ -21,6 +27,14 @@ typedef u64 nonce_t;
 typedef u64 node_t;
 #endif
 #include <openssl/sha.h>
+
+
+
+typedef struct {
+	u32 len;
+	nonce_t nonce;
+} cycle_t;
+
 
 // d(evice s)ipnode
 __device__ node_t dipnode(siphash_ctx * ctx, nonce_t nce, u32 uorv) {
@@ -73,6 +87,10 @@ __device__ node_t dipnode(siphash_ctx * ctx, nonce_t nce, u32 uorv) {
 #endif
 // grow with cube root of size, hardly affected by trimming
 #define MAXPATHLEN (8 << (SIZESHIFT/3))
+
+#define FINDPATH_GPU 1
+#define MAXFOUNDCYCLES 16
+#define USE_BITS_FILE 1
 
 #define checkCudaErrors(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true) {
@@ -169,6 +187,29 @@ public:
         return (node_t)(cu & (SIZE-1));
       }
     }
+  }
+
+  __device__ void dset(node_t u, node_t v) {
+	  u64 niew = (u64)u << SIZESHIFT | v;
+	  for (node_t ui = u >> IDXSHIFT;; ui = (ui + 1) & CUCKOO_MASK) {
+		  u64 old = cuckoo[ui];
+		  if (old == 0 || (old >> SIZESHIFT) == (u & KEYMASK)) {
+			  cuckoo[ui] = niew;
+			  return;
+		  }
+	  }
+  }
+
+  __device__ node_t node(node_t u) const {
+	  for (node_t ui = u >> IDXSHIFT;; ui = (ui + 1) & CUCKOO_MASK) {
+		  u64 cu = cuckoo[ui];
+		  if (!cu)
+			  return 0;
+		  if ((cu >> SIZESHIFT) == (u & KEYMASK)) {
+			  assert(((ui - (u >> IDXSHIFT)) & CUCKOO_MASK) < MAXDRIFT);
+			  return (node_t)(cu & (SIZE - 1));
+		  }
+	  }
   }
 };
 
@@ -271,7 +312,7 @@ __device__ u32 path(cuckoo_hash * cuckoo, node_t u, node_t *us, int * err) {
 				return nu;
 			}
 			else {
-				*err = ERR_ILLEGAL_CYCLE;
+ 				*err = ERR_ILLEGAL_CYCLE;
 				return MAXPATHLEN - nu;
 			}
 		}
@@ -281,16 +322,20 @@ __device__ u32 path(cuckoo_hash * cuckoo, node_t u, node_t *us, int * err) {
 }
 
 //__launch_bounds__(TPB, 1)
-__global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * us, node_t * vs, cycle_t * found_cycles, nonce_t * solution) {
-	node_t gid = 32 * (blockIdx.x * blockDim.x + threadIdx.x);
-	u32 cycles_found = 0;
-	u32 bits = ctx->alive.block(gid);
-	for (nonce_t nonce = gid; nonce < gid + 32; nonce++) {
-		if (!(bits >> (nonce % 32) & 1)) {
+__global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * us, node_t * vs, cycle_t * found_cycles, u32 * cycles_found) {
+	node_t block = 32 * (blockIdx.x * blockDim.x + threadIdx.x);
+	//node_t start_nonce = 32 * block_id;
+	u32 bits = ctx->alive.block(block);
+	//nonce_t nonce = id + threadIdx.x % 32;
+	for (nonce_t nonce = block; nonce < block + 32; nonce++) {
+		if ((bits >> (nonce % 32) & 1)) {
 			node_t u0 = dipnode(&ctx->sip_ctx, nonce, 0), v0 = dipnode(&ctx->sip_ctx, nonce, 1);
 			if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
 				continue;
-			node_t u = cuckoo->node(us[0] = u0), v = cuckoo->node(vs[0] = v0);
+			us[0] = u0;
+			vs[0] = v0;
+			node_t u = cuckoo->node(us[0]);
+			node_t v = cuckoo->node(vs[0]);
 			int err = 0;
 			u32 nu = path(cuckoo, u, us, &err), nv = path(cuckoo, v, vs, &err);
 			if (err != 0) {
@@ -300,10 +345,15 @@ __global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * us, 
 				u32 min = nu < nv ? nu : nv;
 				for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++);
 				u32 len = nu + nv + 1;
-
-				found_cycles[cycles_found].len = len;
-				found_cycles[cycles_found].nonce = nonce;
-				cycles_found++;
+				u32 slot = atomicInc(cycles_found, MAXFOUNDCYCLES);
+				if (slot < MAXFOUNDCYCLES) {
+					found_cycles[slot].len = len;
+					found_cycles[slot].nonce = nonce;
+				}
+				else {
+					// raise err
+					return;
+				}
 				/*
 				if(len == PROOFSIZE) {
 				std::set<edge> cycle;
@@ -366,11 +416,17 @@ typedef std::pair<node_t,node_t> edge;
 #endif
 
 int main(int argc, char **argv) {
+
+#ifndef _DEBUG // getopt assertion trouble
   int nthreads = 1;
   int ntrims   = 1 + (PART_BITS+3)*(PART_BITS+4)/2;
   const char *header = "";
   bool profiling = false;
   int c;
+
+
+  
+
   while ((c = getopt (argc, argv, "h:m:n:t:p")) != -1) {
     switch (c) {
       case 'h':
@@ -387,6 +443,14 @@ int main(int argc, char **argv) {
 		  break;
     }
   }
+#else
+	int nthreads = 4096;
+	int ntrims = 7;
+	const char *header = "22";
+	bool profiling = false;
+#endif
+
+
   printf("Looking for %d-cycle on cuckoo%d(\"%s\") with 50%% edges, %d trims, %d threads\n",
                PROOFSIZE, SIZESHIFT, header, ntrims, nthreads);
   u64 edgeBytes = HALFSIZE/8, nodeBytes = TWICE_WORDS*sizeof(u32);
@@ -407,6 +471,9 @@ int main(int argc, char **argv) {
   checkCudaErrors(cudaMalloc((void**)&device_ctx, sizeof(cuckoo_ctx)));
   cudaMemcpy(device_ctx, &ctx, sizeof(cuckoo_ctx), cudaMemcpyHostToDevice);
 
+  fstream bitsFile;
+
+#if USE_BITS_FILE == 0
   cudaEvent_t start, stop;
 
   if (profiling) {  
@@ -439,6 +506,17 @@ int main(int argc, char **argv) {
   cudaMemcpy(bits, ctx.alive.bits, (HALFSIZE/32) * sizeof(u32), cudaMemcpyDeviceToHost);
   checkCudaErrors(cudaFree(ctx.alive.bits));
   checkCudaErrors(cudaFree(ctx.nonleaf.bits));
+  
+  bitsFile.open("bits.bin", ios::out | ios::binary);
+  bitsFile.write((char *)bits, HALFSIZE / 8);
+#else
+  bitsFile.open("bits.bin", ios::in | ios::binary);
+  u32 *bits;
+  bits = (u32 *)calloc(HALFSIZE / 32, sizeof(u32));
+  assert(bits != 0);
+  bitsFile.read((char *)bits, HALFSIZE / 8);
+  cudaMemcpy(ctx.alive.bits, bits, (HALFSIZE / 32) * sizeof(u32), cudaMemcpyHostToDevice);
+#endif
 
   u32 cnt = 0;
   for (int i = 0; i < HALFSIZE/32; i++) {
@@ -454,9 +532,9 @@ int main(int argc, char **argv) {
   }
 
   cuckoo_hash &cuckoo = *(new cuckoo_hash());
-  node_t us[MAXPATHLEN], vs[MAXPATHLEN];
+  
 
-#ifdef FINDPATH_GPU
+#if FINDPATH_GPU == 1
   u32 cuckooBytes = CUCKOO_SIZE * sizeof(u64);
   checkCudaErrors(cudaMalloc((void**)&cuckoo.cuckoo, cuckooBytes));
   checkCudaErrors(cudaMemset(cuckoo.cuckoo, 0, cuckooBytes));
@@ -465,32 +543,34 @@ int main(int argc, char **argv) {
   cudaMemcpy(device_cuckoo, &cuckoo, sizeof(cuckoo_hash), cudaMemcpyHostToDevice);
 
 
-
+  node_t * us, * vs;
 
   u32 pathBytes = MAXPATHLEN * sizeof(node_t);
   checkCudaErrors(cudaMalloc((void**)&us, pathBytes));
   checkCudaErrors(cudaMalloc((void**)&vs, pathBytes));
-  //checkCudaErrors(cudaMemset((void *)us, 0, pathBytes));
-  //checkCudaErrors(cudaMemset((void *)vs, 0, pathBytes));
+  checkCudaErrors(cudaMemset((void *)us, 0, pathBytes));
+  checkCudaErrors(cudaMemset((void *)vs, 0, pathBytes));
 
-  cycle_t cycle_buffer[MAXFOUNDCYCLES];
+  cycle_t * cycle_buffer;
   checkCudaErrors(cudaMalloc((void**)&cycle_buffer, sizeof(cycle_t) * MAXFOUNDCYCLES));
-  //checkCudaErrors(cudaMemset(found_cycles, 0, sizeof(cycle_t) * MAXFOUNDCYCLES));
+  checkCudaErrors(cudaMemset(cycle_buffer, 0, sizeof(cycle_t) * MAXFOUNDCYCLES));
 
-  nonce_t solution[PROOFSIZE];
-  checkCudaErrors(cudaMalloc((void**)&solution, sizeof(nonce_t) * PROOFSIZE));
-  //checkCudaErrors(cudaMemset(solution, 0, sizeof(nonce_t) * PROOFSIZE));
+  u32 * cycles_found;
+  checkCudaErrors(cudaMalloc((void**)&cycles_found, sizeof(u32)));
+  checkCudaErrors(cudaMemset(cycles_found, 0, sizeof(u32)));
 
-  find_cycles << <(HALFSIZE / 32) / TPB, TPB >> >(device_ctx, device_cuckoo, us, vs, cycle_buffer, solution);
+  find_cycles << <(HALFSIZE / 32) / TPB, TPB >> >(device_ctx, device_cuckoo, us, vs, cycle_buffer, cycles_found);
   cycle_t found_cycles[MAXFOUNDCYCLES];
-  cudaMemcpy(found_cycles, found_cycles, sizeof(cycle_t) * MAXFOUNDCYCLES, cudaMemcpyDeviceToHost);
+  cudaMemcpy(found_cycles, cycle_buffer, sizeof(cycle_t) * MAXFOUNDCYCLES, cudaMemcpyDeviceToHost);
   for (int i = 0; i < MAXFOUNDCYCLES; i++) {
 	  if (found_cycles[i].len > 0) {
-		  printf("% 4d-cycle found at %d:%d%%\n", found_cycles[i].len, 0, (u32)(found_cycles[i].nonce * 100L / HALFSIZE));
+		  printf("% 4u-cycle found at %u:%u%%\n", found_cycles[i].len, 0, (u32)(found_cycles[i].nonce * 100L / HALFSIZE));
 	  }
   }
 
 #else 
+  
+  node_t us[MAXPATHLEN], vs[MAXPATHLEN];
 
   for (nonce_t block = 0; block < HALFSIZE; block += 32) {
     for (nonce_t nonce = block; nonce < block+32 && nonce < HALFSIZE; nonce++) {
