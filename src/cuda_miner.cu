@@ -322,71 +322,81 @@ __device__ u32 path(cuckoo_hash * cuckoo, node_t u, node_t *us, int * err) {
 }
 
 //__launch_bounds__(TPB, 1)
-__global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * us, node_t * vs, cycle_t * found_cycles, u32 * cycles_found) {
-	node_t block = 32 * (blockIdx.x * blockDim.x + threadIdx.x);
-	//node_t start_nonce = 32 * block_id;
-	u32 bits = ctx->alive.block(block);
-	//nonce_t nonce = id + threadIdx.x % 32;
-	for (nonce_t nonce = block; nonce < block + 32; nonce++) {
-		if ((bits >> (nonce % 32) & 1)) {
-			node_t u0 = dipnode(&ctx->sip_ctx, nonce, 0), v0 = dipnode(&ctx->sip_ctx, nonce, 1);
-			if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
-				continue;
-			us[0] = u0;
-			vs[0] = v0;
-			node_t u = cuckoo->node(us[0]);
-			node_t v = cuckoo->node(vs[0]);
-			int err = 0;
-			u32 nu = path(cuckoo, u, us, &err), nv = path(cuckoo, v, vs, &err);
-			if (err != 0) {
-				return;
-			}
-			if (us[nu] == vs[nv]) {
-				u32 min = nu < nv ? nu : nv;
-				for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++);
-				u32 len = nu + nv + 1;
-				u32 slot = atomicInc(cycles_found, MAXFOUNDCYCLES);
-				if (slot < MAXFOUNDCYCLES) {
-					found_cycles[slot].len = len;
-					found_cycles[slot].nonce = nonce;
-				}
-				else {
-					// raise err
+__global__ void find_cycles(cuckoo_ctx *ctx, cuckoo_hash * cuckoo, node_t * g_us, node_t * g_vs, cycle_t * found_cycles, u32 * cycles_found) {
+	u32 gid = (blockIdx.x * blockDim.x + threadIdx.x);
+
+	for (node_t block = 32 * gid; block < HALFSIZE; block += ctx->nthreads * 32) {
+		node_t * us = g_us + gid * MAXPATHLEN;
+		node_t * vs = g_vs + gid * MAXPATHLEN;
+
+		for (u32 i = 0; i < MAXPATHLEN; i++) {
+			us[i] = 0;
+			vs[i] = 0;
+		}
+
+		u32 bits = ctx->alive.block(block);
+
+		for (nonce_t nonce = block; nonce < block + 32; nonce++) {
+			if ((bits >> (nonce % 32) & 1)) {
+				node_t u0 = dipnode(&ctx->sip_ctx, nonce, 0), v0 = dipnode(&ctx->sip_ctx, nonce, 1);
+				if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
+					continue;
+				us[0] = u0;
+				vs[0] = v0;
+				node_t u = cuckoo->node(us[0]);
+				node_t v = cuckoo->node(vs[0]);
+				int err = 0;
+				u32 nu = path(cuckoo, u, us, &err), nv = path(cuckoo, v, vs, &err);
+				if (err != 0) {
 					return;
 				}
-				/*
-				if(len == PROOFSIZE) {
-				std::set<edge> cycle;
-				u32 n;
-				cycle.insert(edge(*us, *vs));
-				while (nu--)
-				cycle.insert(edge(us[(nu + 1)&~1], us[nu | 1])); // u's in even position; v's in odd
-				while (nv--)
-				cycle.insert(edge(vs[nv | 1], vs[(nv + 1)&~1])); // u's in odd position; v's in even
-				for (nonce_t nce = n = 0; nce < HALFSIZE; nce++)
-				if (!(bits[nce / 32] >> (nce % 32) & 1)) {
-				edge e(sipnode(&ctx->sip_ctx, nce, 0), sipnode(&ctx->sip_ctx, nce, 1));
-				if (cycle.find(e) != cycle.end()) {
-				solution[n] = nonce;
-				if (PROOFSIZE > 2)
-				cycle.erase(e);
-				n++;
+				if (us[nu] == vs[nv]) {
+					u32 min = nu < nv ? nu : nv;
+					for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++);
+					u32 len = nu + nv + 1;
+					u32 slot = atomicInc(cycles_found, MAXFOUNDCYCLES);
+					if (slot < MAXFOUNDCYCLES) {
+						found_cycles[slot].len = len;
+						found_cycles[slot].nonce = nonce;
+					}
+					else {
+						// raise err
+						return;
+					}
+					/*
+					if(len == PROOFSIZE) {
+					std::set<edge> cycle;
+					u32 n;
+					cycle.insert(edge(*us, *vs));
+					while (nu--)
+					cycle.insert(edge(us[(nu + 1)&~1], us[nu | 1])); // u's in even position; v's in odd
+					while (nv--)
+					cycle.insert(edge(vs[nv | 1], vs[(nv + 1)&~1])); // u's in odd position; v's in even
+					for (nonce_t nce = n = 0; nce < HALFSIZE; nce++)
+					if (!(bits[nce / 32] >> (nce % 32) & 1)) {
+					edge e(sipnode(&ctx->sip_ctx, nce, 0), sipnode(&ctx->sip_ctx, nce, 1));
+					if (cycle.find(e) != cycle.end()) {
+					solution[n] = nonce;
+					if (PROOFSIZE > 2)
+					cycle.erase(e);
+					n++;
+					}
+					}
+					assert(n == PROOFSIZE);
+					}
+					*/
+					continue;
 				}
+				if (nu < nv) {
+					while (nu--)
+						cuckoo->dset(us[nu + 1], us[nu]);
+					cuckoo->dset(u0, v0);
 				}
-				assert(n == PROOFSIZE);
+				else {
+					while (nv--)
+						cuckoo->dset(vs[nv + 1], vs[nv]);
+					cuckoo->dset(v0, u0);
 				}
-				*/
-				continue;
-			}
-			if (nu < nv) {
-				while (nu--)
-					cuckoo->dset(us[nu + 1], us[nu]);
-				cuckoo->dset(u0, v0);
-			}
-			else {
-				while (nv--)
-					cuckoo->dset(vs[nv + 1], vs[nv]);
-				cuckoo->dset(v0, u0);
 			}
 		}
 	}
@@ -543,13 +553,13 @@ int main(int argc, char **argv) {
   cudaMemcpy(device_cuckoo, &cuckoo, sizeof(cuckoo_hash), cudaMemcpyHostToDevice);
 
 
-  node_t * us, * vs;
+  node_t * g_us, * g_vs;
 
-  u32 pathBytes = MAXPATHLEN * sizeof(node_t);
-  checkCudaErrors(cudaMalloc((void**)&us, pathBytes));
-  checkCudaErrors(cudaMalloc((void**)&vs, pathBytes));
-  checkCudaErrors(cudaMemset((void *)us, 0, pathBytes));
-  checkCudaErrors(cudaMemset((void *)vs, 0, pathBytes));
+  u32 pathBytes = nthreads * MAXPATHLEN * sizeof(node_t);
+  checkCudaErrors(cudaMalloc((void**)&g_us, pathBytes));
+  checkCudaErrors(cudaMalloc((void**)&g_vs, pathBytes));
+  checkCudaErrors(cudaMemset((void *)g_us, 0, pathBytes));
+  checkCudaErrors(cudaMemset((void *)g_vs, 0, pathBytes));
 
   cycle_t * cycle_buffer;
   checkCudaErrors(cudaMalloc((void**)&cycle_buffer, sizeof(cycle_t) * MAXFOUNDCYCLES));
@@ -558,9 +568,12 @@ int main(int argc, char **argv) {
   u32 * cycles_found;
   checkCudaErrors(cudaMalloc((void**)&cycles_found, sizeof(u32)));
   checkCudaErrors(cudaMemset(cycles_found, 0, sizeof(u32)));
-
-  find_cycles << <(HALFSIZE / 32) / TPB, TPB >> >(device_ctx, device_cuckoo, us, vs, cycle_buffer, cycles_found);
+  
   cycle_t found_cycles[MAXFOUNDCYCLES];
+  memset(found_cycles, 0, MAXFOUNDCYCLES * sizeof(cycle_t));
+
+  find_cycles <<< nthreads / TPB, TPB >>>(device_ctx, device_cuckoo, g_us, g_vs, cycle_buffer, cycles_found);
+ 
   cudaMemcpy(found_cycles, cycle_buffer, sizeof(cycle_t) * MAXFOUNDCYCLES, cudaMemcpyDeviceToHost);
   for (int i = 0; i < MAXFOUNDCYCLES; i++) {
 	  if (found_cycles[i].len > 0) {
