@@ -261,7 +261,7 @@ __device__ u32 path(cuckoo_hash &cuckoo, node_t u, node_t *us) {
 }
 
 __device__ u32 find_edge(uint2 * cycle, uint2 edge) {
-	for (u32 i = 0; i < 42; i++) {
+	for (u32 i = 0; i < PROOFSIZE; i++) {
 		if (cycle[i] == edge) return i;
 	}
 	return PROOFSIZE;
