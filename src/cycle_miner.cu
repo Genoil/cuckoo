@@ -6,6 +6,12 @@
 
 #include <stdint.h>
 #include <string.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#define __builtin_popcountll(__i) static_cast<int>(__popcnt64(__i))
+#endif
+
 #include "cuckoo.h"
 #if SIZESHIFT <= 32
   typedef u32 nonce_t;
@@ -16,6 +22,8 @@
 #endif
 #include <openssl/sha.h>
 typedef unsigned long long ull;
+
+static __device__ __forceinline__ bool operator== (uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
 
 // d(evice s)ipnode
 #if (__CUDA_ARCH__  >= 320) // redefine ROTL to use funnel shifter, 3% speed gain
@@ -252,37 +260,44 @@ __device__ u32 path(cuckoo_hash &cuckoo, node_t u, node_t *us) {
   return nu;
 }
 
-__device__ void solution(cuckoo_ctx *ctx, node_t *us, u32 nu, node_t *vs, u32 nv) {
-  printf("Solution");
-#if 0
-  std::set<edge> cycle;
-  u32 n = 0;
-  cycle.insert(edge(*us, *vs));
-  while (nu--)
-    cycle.insert(edge(us[(nu+1)&~1], us[nu|1])); // u's in even position; v's in odd
-  while (nv--)
-    cycle.insert(edge(vs[nv|1], vs[(nv+1)&~1])); // u's in odd position; v's in even
-  shrinkingset &alive = ctx->alive;
-  for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
-    u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
-      u32 ffs = __builtin_ffsll(alive32);
-      nonce += ffs; alive32 >>= ffs;
-      edge e(sipnode(&ctx.sip_ctx, nonce, 0), sipnode(&ctx.sip_ctx, nonce, 1));
-      if (cycle.find(e) != cycle.end()) {
-        printf(" %x", nonce);
-        if (PROOFSIZE > 2)
-          cycle.erase(e);
-        n++;
-      }
-    }
-  }
-  assert(n==PROOFSIZE);
-#endif
-  printf("\n");
+__device__ u32 find_edge(uint2 * cycle, uint2 * edge) {
+	for (u32 i = 0; i < 42; i++) {
+		if (cycle[i].x == edge->x) return i;
+	}
+	return PROOFSIZE;
 }
 
-__global__ void find_cycles(cuckoo_ctx *ctx) {
+__global__ void find_solution(cuckoo_ctx *ctx, uint2 * cycle) {
+ 
+#if 1
+	
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = 0;
+	shrinkingset &alive = ctx->alive;
+	siphash_ctx sip_ctx = ctx->sip_ctx;
+
+	for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
+		u32 alive32 = alive.block(block);
+		for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
+			u32 ffs = __ffs(alive32);
+			nonce += ffs; alive32 >>= ffs;
+			uint2 edge = make_uint2(dipnode(sip_ctx, nonce, 0)<<1, dipnode(sip_ctx, nonce, 1)<<1|1);
+			u32 pos = find_edge(cycle, &edge);
+			if (pos != PROOFSIZE) {
+			printf("%x ", nonce);
+			//if (PROOFSIZE > 2)
+			//  cycle.erase(i);
+			n++;
+			}
+		}
+	}
+
+	assert(n==PROOFSIZE);
+#endif
+  //printf("\n");
+}
+
+__global__ void find_cycles(cuckoo_ctx *ctx, uint2 * cycle, u32 * cycles_found) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
   node_t us[MAXPATHLEN], vs[MAXPATHLEN];
   shrinkingset &alive = ctx->alive;
@@ -303,8 +318,19 @@ __global__ void find_cycles(cuckoo_ctx *ctx) {
         for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++) ;
         u32 len = nu + nv + 1;
         printf("% 4d-cycle found at %d:%d%%\n", len, id, (u32)(nonce*100L/HALFSIZE));
-        if (len == PROOFSIZE)
-          solution(ctx, us, nu, vs, nv);
+		if (len == PROOFSIZE) {
+			u32 slot = atomicInc(cycles_found, 1);
+			if (slot == 0) { // max 1 solution for now
+				u32 n = 0;
+				u32 i = 0;
+				cycle[i] = make_uint2(*us, *vs);
+				while (nu--)
+					cycle[++i] = make_uint2(us[(nu + 1)&~1], us[nu | 1]); // u's in even position; v's in odd
+				while (nv--) {
+					cycle[++i] = make_uint2(vs[nv | 1], vs[(nv + 1)&~1]); // u's in odd position; v's in even
+				}
+			}
+		}
         continue;
       }
       if (nu < nv) {
@@ -320,9 +346,13 @@ __global__ void find_cycles(cuckoo_ctx *ctx) {
   }
 }
 
-typedef std::pair<node_t,node_t> edge;
+typedef std::pair<node_t, node_t> edge;
 
+#ifdef _POSIX_VERSION
 #include <unistd.h>
+#else
+#include <getopt.h>
+#endif
 
 int main(int argc, char **argv) {
   int nthreads = 1;
@@ -409,8 +439,18 @@ int main(int argc, char **argv) {
   checkCudaErrors(cudaMalloc((void**)&ctx.sols, solsBytes));
   cudaMemcpy(device_ctx, &ctx, sizeof(cuckoo_ctx), cudaMemcpyHostToDevice);
 
-  find_cycles<<<nthreads/tpb,tpb>>>(device_ctx);
- 
+  uint2 * cycle;
+  checkCudaErrors(cudaMalloc((void**)&cycle, PROOFSIZE * sizeof(node_t)));
+  checkCudaErrors(cudaMemset((void *)cycle, 0, PROOFSIZE * sizeof(node_t)));
+
+  u32 * cycles_found;
+  checkCudaErrors(cudaMalloc((void**)&cycles_found, sizeof(u32)));
+  checkCudaErrors(cudaMemset(cycles_found, 0, sizeof(u32)));
+  
+  find_cycles <<<nthreads / tpb, tpb >> >(device_ctx, cycle, cycles_found);
+
+  find_solution << <nthreads / tpb, tpb >> >(device_ctx, cycle);
+
   // cudaMemcpy(found_cycles, &ctx.sols, solsBytes, cudaMemcpyDeviceToHost);
 
   checkCudaErrors(cudaFree(ctx.alive.bits));
