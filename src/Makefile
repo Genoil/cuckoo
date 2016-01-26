@@ -1,5 +1,6 @@
 # -Wno-deprecated-declarations shuts up Apple OSX clang
-FLAGS = -Wall -Wno-deprecated-declarations -D_POSIX_C_SOURCE=200112L -O3 -pthread 
+OPT = -O3
+FLAGS = -Wall -Wno-deprecated-declarations -D_POSIX_C_SOURCE=200112L $(OPT) -pthread 
 LIBS = -lssl -lcrypto
 # leave out -l crypto if using sha256.c instead of openssl
 CC = cc -std=c99 $(FLAGS)
@@ -63,6 +64,9 @@ cuckoo28.1:	cuckoo.h cuckoo_miner.h cuckoo_miner.cpp Makefile
 speedup:	cuckoo28 Makefile
 	for i in 1 2 4 6 8 12 16 20 24 28 32 40 48 56 64 72; do echo $$i; (time for j in {0..6}; do ./cuckoo28 -t $$i -h $$j; done) 2>&1; done > speedup
 
+cudaspeedup28:	cuda28.2 Makefile
+	for t in 65536 32768 16384 8192 4096 2048 1024 512 256 128 64 32; do echo $$t; for h in 0 1 2 3 4; do time ./cuda28.2 -t $$t -n 24 -h $$h; done; done
+
 cuckoo30:	cuckoo.h cuckoo_miner.h cuckoo_miner.cpp Makefile
 	$(GPP) -o cuckoo30 -DSIZESHIFT=30 cuckoo_miner.cpp $(LIBS)
 
@@ -103,13 +107,16 @@ bounty32:	cuckoo.h bounty_miner.h bounty_miner.cpp Makefile
 	$(GPP) -o bounty32 -DSIMD -DSIZESHIFT=32 bounty_miner.cpp $(LIBS)
 
 cuda28:	cuda_miner.cu Makefile
-	nvcc -o cuda28 -DSIZESHIFT=28 -arch sm_20 cuda_miner.cu -lssl -lcrypto 
+	nvcc -o cuda28 -DSIZESHIFT=28 -arch sm_35 cuda_miner.cu -lssl -lcrypto 
+
+cycle28:	cycle_miner.cu Makefile
+	nvcc -o cycle28 -DSIZESHIFT=28 -arch sm_35 cycle_miner.cu -lssl -lcrypto 
 
 cuda30:	cuda_miner.cu Makefile
-	nvcc -o cuda30 -DSIZESHIFT=30 -arch sm_20 cuda_miner.cu -lssl -lcrypto
+	nvcc -o cuda30 -DSIZESHIFT=30 -arch sm_35 cuda_miner.cu -lssl -lcrypto
 
 cuda32:	cuda_miner.cu Makefile
-	nvcc -o cuda32 -DSIZESHIFT=32 -arch sm_20 cuda_miner.cu -lssl -lcrypto
+	nvcc -o cuda32 -DSIZESHIFT=32 -arch sm_35 cuda_miner.cu -lssl -lcrypto
 
 cpubounty:	cuckoo28 bounty28 cuckoo30 bounty30 cuckoo32 bounty32 Makefile
 	for c in 28 30 32; do for t in 1 2 4 8; do time for h in {0..9}; do ./cuckoo$$c -t $$t -h $$h; done; time for h in {0..9}; do ./bounty$$c -t $$t -h $$h; done;done; done
@@ -128,6 +135,9 @@ speedup30.3:	cuckoo30.3 Makefile
 
 cuckoo32:	cuckoo.h cuckoo_miner.h cuckoo_miner.cpp Makefile
 	$(GPP) -o cuckoo32 -DSIZESHIFT=32 cuckoo_miner.cpp $(LIBS)
+
+cuckoo35:	cuckoo.h cuckoo_miner.h cuckoo_miner.cpp Makefile
+	$(GPP) -o cuckoo35 -DSIZESHIFT=35 cuckoo_miner.cpp $(LIBS)
 
 cuckoo32.1:	cuckoo.h cuckoo_miner.h cuckoo_miner.cpp Makefile
 	$(GPP) -o cuckoo32.1 -DPART_BITS=1 -DSIZESHIFT=32 cuckoo_miner.cpp $(LIBS)
@@ -148,7 +158,7 @@ java:	Cuckoo.class SimpleMiner.class Makefile
 	java SimpleMiner -h 85 | tail -1 | java Cuckoo -h 85
 
 cuda:	cuda_miner.cu Makefile
-	nvcc -o cuda -DSIZESHIFT=14 -arch sm_20 cuda_miner.cu -lssl -lcrypto
+	nvcc -o cuda -DSIZESHIFT=14 -arch sm_35 cuda_miner.cu -lssl -lcrypto
 
 runcuda:	cuda
 	./cuda -h header

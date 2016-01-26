@@ -1,5 +1,5 @@
 // Cuckoo Cycle, a memory-hard proof-of-work
-// Copyright (c) 2013-2015 John Tromp
+// Copyright (c) 2013-2016 John Tromp
 
 #include "cuckoo_miner.h"
 #include <unistd.h>
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
   for (unsigned s = 0; s < ctx.nsols; s++) {
     printf("Solution");
     for (int i = 0; i < PROOFSIZE; i++)
-      printf(" %lx", (long)ctx.sols[s][i]);
+      printf(" %jx", (uintmax_t)ctx.sols[s][i]);
     printf("\n");
   }
   return 0;

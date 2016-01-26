@@ -1,11 +1,9 @@
 // Cuckoo Cycle, a memory-hard proof-of-work
-// Copyright (c) 2013-2015 John Tromp
+// Copyright (c) 2013-2016 John Tromp
 
 #include <stdint.h>
 #include <string.h>
 #include <openssl/sha.h> // if openssl absent, use #include "sha256.c"
-
-#include "vector.cuh"
 
 // proof-of-work parameters
 #ifndef SIZESHIFT 
@@ -24,8 +22,9 @@ typedef uint64_t u64;
 
 typedef union {
   u64 v[4];
-  uint2 vv[4];
-  uint4 vvvv[4];
+#ifdef __CUDACC__
+  uint2 v2[4];
+#endif
 } siphash_ctx;
  
 #define U8TO64_LE(p) \
@@ -38,8 +37,8 @@ typedef union {
 #define SHA256(d, n, md) do { \
     SHA256_CTX c; \
     SHA256_Init(&c); \
-    SHA256_Update(&c, (uint8_t *)d, n); \
-    SHA256_Final((uint8_t *)md, &c); \
+    SHA256_Update(&c, d, n); \
+    SHA256_Final(md, &c); \
   } while (0)
 #endif
  
