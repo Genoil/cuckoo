@@ -211,7 +211,8 @@ __global__ void count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   twice_set &nonleaf = ctx->nonleaf;
   siphash_ctx sip_ctx = ctx->sip_ctx; // local copy sip context; 2.5% speed gain
   int id = blockIdx.x * blockDim.x + threadIdx.x;
-  for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
+  nonce_t block = id * 32;
+  //for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
     u32 alive32 = alive.block(block);
     for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
       u32 ffs = __ffs(alive32);
@@ -221,7 +222,7 @@ __global__ void count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
         nonleaf.set(u >> PART_BITS);
       }
     }
-  }
+  //}
 }
 
 __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
@@ -229,7 +230,8 @@ __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   twice_set &nonleaf = ctx->nonleaf;
   siphash_ctx sip_ctx = ctx->sip_ctx;
   int id = blockIdx.x * blockDim.x + threadIdx.x;
-  for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
+  nonce_t block = id * 32;
+  //for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
     u32 alive32 = alive.block(block);
     for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
       u32 ffs = __ffs(alive32);
@@ -241,7 +243,7 @@ __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
         }
       }
     }
-  }
+  //}
 }
 
 __device__ u32 path(cuckoo_hash &cuckoo, node_t u, node_t *us) {
@@ -267,43 +269,14 @@ __device__ u32 find_edge(uint2 * cycle, uint2 edge) {
 	return PROOFSIZE;
 }
 
-__global__ void find_solution(cuckoo_ctx *ctx, uint2 * cycle) {
- 
-#if 1
-	
-	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	int n = 0;
-	shrinkingset &alive = ctx->alive;
-	siphash_ctx sip_ctx = ctx->sip_ctx;
-
-	for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
-		u32 alive32 = alive.block(block);
-		for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
-			u32 ffs = __ffs(alive32);
-			nonce += ffs; alive32 >>= ffs;
-			uint2 edge = make_uint2(dipnode(sip_ctx, nonce, 0)<<1, dipnode(sip_ctx, nonce, 1)<<1|1);
-			u32 pos = find_edge(cycle, edge);
-			if (pos != PROOFSIZE) {
-			printf("%x ", nonce);
-			//if (PROOFSIZE > 2)
-			//  cycle.erase(i);
-			n++;
-			}
-		}
-	}
-
-	assert(n==PROOFSIZE);
-#endif
-  //printf("\n");
-}
-
 __global__ void find_cycles(cuckoo_ctx *ctx, uint2 * cycle, u32 * cycles_found) {
   int id = blockIdx.x * blockDim.x + threadIdx.x;
   node_t us[MAXPATHLEN], vs[MAXPATHLEN];
   shrinkingset &alive = ctx->alive;
   siphash_ctx sip_ctx = ctx->sip_ctx;
   cuckoo_hash &cuckoo = ctx->cuckoo;
-  for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
+  nonce_t block = id * 32;
+  //for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
     u32 alive32 = alive.block(block);
     for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
       u32 ffs = __ffs(alive32);
@@ -343,10 +316,32 @@ __global__ void find_cycles(cuckoo_ctx *ctx, uint2 * cycle, u32 * cycles_found) 
         cuckoo.set(v0, u0);
       }
     }
-  }
+  //}
 }
 
-typedef std::pair<node_t, node_t> edge;
+__global__ void find_solution(cuckoo_ctx *ctx, uint2 * cycle) {
+
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	int n = 0;
+	shrinkingset &alive = ctx->alive;
+	siphash_ctx sip_ctx = ctx->sip_ctx;
+
+	u32 block = id * 32;
+	//for (nonce_t block = id * 32; block < HALFSIZE; block += ctx->nthreads * 32) {
+		u32 alive32 = alive.block(block);
+		for (nonce_t nonce = block - 1; alive32;) { // -1 compensates for 1-based ffs
+			u32 ffs = __ffs(alive32);
+			nonce += ffs; alive32 >>= ffs;
+			uint2 edge = make_uint2(dipnode(sip_ctx, nonce, 0) << 1, dipnode(sip_ctx, nonce, 1) << 1 | 1);
+			u32 pos = find_edge(cycle, edge);
+			if (pos != PROOFSIZE) {
+				printf("%x ", nonce);
+				n++;
+			}
+		}
+	//}
+	assert(n == PROOFSIZE);
+}
 
 #ifdef _POSIX_VERSION
 #include <unistd.h>
@@ -407,8 +402,8 @@ int main(int argc, char **argv) {
     for (u32 uorv = 0; uorv < 2; uorv++) {
       for (u32 part = 0; part <= PART_MASK; part++) {
         checkCudaErrors(cudaMemset(ctx.nonleaf.bits, 0, nodeBytes));
-        count_node_deg<<<nthreads/tpb,tpb>>>(device_ctx, uorv, part);
-        kill_leaf_edges<<<nthreads/tpb,tpb>>>(device_ctx, uorv, part);
+		count_node_deg <<<(HALFSIZE / 32) / tpb, tpb >> >(device_ctx, uorv, part);
+		kill_leaf_edges <<<(HALFSIZE / 32) / tpb, tpb >> >(device_ctx, uorv, part);
       }
     }
   }
@@ -447,9 +442,9 @@ int main(int argc, char **argv) {
   checkCudaErrors(cudaMalloc((void**)&cycles_found, sizeof(u32)));
   checkCudaErrors(cudaMemset(cycles_found, 0, sizeof(u32)));
   
-  find_cycles <<<nthreads / tpb, tpb >> >(device_ctx, cycle, cycles_found);
+  find_cycles <<< (HALFSIZE / 32) / tpb, tpb >> >(device_ctx, cycle, cycles_found);
 
-  find_solution << <nthreads / tpb, tpb >> >(device_ctx, cycle);
+  find_solution <<< (HALFSIZE/32) / tpb, tpb >> >(device_ctx, cycle);
 
   // cudaMemcpy(found_cycles, &ctx.sols, solsBytes, cudaMemcpyDeviceToHost);
 
