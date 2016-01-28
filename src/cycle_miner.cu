@@ -139,6 +139,9 @@ public:
   __device__ u32 block(node_t n) const {
     return ~bits[n/32];
   }
+  __device__ u64 wideblock(node_t n) const {
+	  return ~((u64*)bits)[n / 64];
+  }
 };
 
 #define PART_MASK ((1 << PART_BITS) - 1)
@@ -227,17 +230,16 @@ __global__ void count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   siphash_ctx sip_ctx = ctx->sip_ctx; // local copy sip context; 2.5% speed gain
   int id = blockIdx.x * blockDim.x + threadIdx.x;
   nonce_t block = id * 32;
-  //for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
-    u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
-      u32 ffs = __ffs(alive32);
-      nonce += ffs; alive32 >>= ffs;
-      node_t u = dipnode(sip_ctx, nonce, uorv);
-      if ((u & PART_MASK) == part) {
-        nonleaf.set(u >> PART_BITS);
-      }
+
+  u32 alive32 = alive.block(block);
+  for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
+    u32 ffs = __ffs(alive32);
+    nonce += ffs; alive32 >>= ffs;
+    node_t u = dipnode(sip_ctx, nonce, uorv);
+    if ((u & PART_MASK) == part) {
+      nonleaf.set(u >> PART_BITS);
     }
-  //}
+  }
 }
 
 __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
@@ -246,19 +248,19 @@ __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   siphash_ctx sip_ctx = ctx->sip_ctx;
   int id = blockIdx.x * blockDim.x + threadIdx.x;
   nonce_t block = id * 32;
-  //for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
-    u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
-      u32 ffs = __ffs(alive32);
-      nonce += ffs; alive32 >>= ffs;
-      node_t u = dipnode(sip_ctx, nonce, uorv);
-      if ((u & PART_MASK) == part) {
-        if (!nonleaf.test(u >> PART_BITS)) {
-          alive.reset(nonce);
-        }
-      }
-    }
-  //}
+
+  u32 alive32 = alive.block(block);
+	for (nonce_t nonce = block - 1; alive32;) { // -1 compensates for 1-based ffs
+		u32 ffs = __ffs(alive32);
+		nonce += ffs; alive32 >>= ffs;
+		node_t u = dipnode(sip_ctx, nonce, uorv);
+		if ((u & PART_MASK) == part) {
+			if (!nonleaf.test(u >> PART_BITS)) {
+				alive.reset(nonce);
+			}
+		}
+	}
+
 }
 
 __device__ u32 path(cuckoo_hash &cuckoo, node_t u, node_t *us) {
@@ -283,70 +285,70 @@ __global__ void find_cycles(cuckoo_ctx *ctx) {
   shrinkingset &alive = ctx->alive;
   siphash_ctx sip_ctx = ctx->sip_ctx;
   cuckoo_hash &cuckoo = ctx->cuckoo;
-  //nonce_t block = id * 32;
-  for (nonce_t block = id*32; block < HALFSIZE; block += ctx->nthreads*32) {
-    u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
-      u32 ffs = __ffs(alive32);
-      nonce += ffs; alive32 >>= ffs;
-      node_t u0=dipnode(sip_ctx, nonce, 0)<<1, v0=dipnode(sip_ctx, nonce, 1)<<1|1;
-      if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
-        continue;
-      node_t u = cuckoo.node(us[0] = u0), v = cuckoo.node(vs[0] = v0);
-      u32 nu = path(cuckoo, u, us), nv = path(cuckoo, v, vs);
-      if (us[nu] == vs[nv]) {
-        u32 min = nu < nv ? nu : nv;
-        for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++) ;
-        u32 len = nu + nv + 1;
-        printf("% 4d-cycle found at %d:%d%%\n", len, id, (u32)(nonce*100L/HALFSIZE));
+  //nonce_t block = id * 64;
+  for (nonce_t block = id*64; block < HALFSIZE; block += ctx->nthreads*64) {
+    u64 alive64 = alive.wideblock(block);
+		for (nonce_t nonce = block - 1; alive64;) { // -1 compensates for 1-based ffs
+			u64 ffs = __ffsll(alive64);
+			nonce += ffs; alive64 >>= ffs;
+				node_t u0=dipnode(sip_ctx, nonce, 0)<<1, v0=dipnode(sip_ctx, nonce, 1)<<1|1;
+				if (u0 == 0) // ignore vertex 0 so it can be used as nil for cuckoo[]
+					continue;
+				node_t u = cuckoo.node(us[0] = u0), v = cuckoo.node(vs[0] = v0);
+				u32 nu = path(cuckoo, u, us), nv = path(cuckoo, v, vs);
+				if (us[nu] == vs[nv]) {
+					u32 min = nu < nv ? nu : nv;
+					for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++) ;
+					u32 len = nu + nv + 1;
+					printf("% 4d-cycle found at %d:%d%%\n", len, id, (u32)(nonce*100L/HALFSIZE));
 
-        if (len == PROOFSIZE) {
-          u32 slot = atomicInc(&ctx->nsols, MAXINT);
-          if (slot < MAXSOLS) {
-            noncedge_t *ne = &ctx->sols[slot][0];
-            ne++->edge = make_edge(*us, *vs);
-            while (nu--)
-              ne++->edge = make_edge(us[(nu + 1)&~1], us[nu | 1]); // u's in even position; v's in odd
-            while (nv--)
-              ne++->edge = make_edge(vs[nv | 1], vs[(nv + 1)&~1]); // u's in odd position; v's in even
-          }
-        }
+					if (len == PROOFSIZE) {
+						u32 slot = atomicInc(&ctx->nsols, MAXINT);
+						if (slot < MAXSOLS) {
+							noncedge_t *ne = &ctx->sols[slot][0];
+							ne++->edge = make_edge(*us, *vs);
+							while (nu--)
+								ne++->edge = make_edge(us[(nu + 1)&~1], us[nu | 1]); // u's in even position; v's in odd
+							while (nv--)
+								ne++->edge = make_edge(vs[nv | 1], vs[(nv + 1)&~1]); // u's in odd position; v's in even
+						}
+					}
 
-        continue;
-      }
-      if (nu < nv) {
-        while (nu--)
-          cuckoo.set(us[nu+1], us[nu]);
-        cuckoo.set(u0, v0);
-      } else {
-        while (nv--)
-          cuckoo.set(vs[nv+1], vs[nv]);
-        cuckoo.set(v0, u0);
-      }
-    }
-  }
+					continue;
+				}
+				if (nu < nv) {
+					while (nu--)
+						cuckoo.set(us[nu+1], us[nu]);
+					cuckoo.set(u0, v0);
+				} else {
+					while (nv--)
+						cuckoo.set(vs[nv+1], vs[nv]);
+					cuckoo.set(v0, u0);
+				}
+			}
+	 }
 }
 
 __global__ void find_nonces(cuckoo_ctx *ctx) {
-  int id = blockIdx.x * blockDim.x + threadIdx.x;
-  shrinkingset &alive = ctx->alive;
-  siphash_ctx sip_ctx = ctx->sip_ctx;
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	shrinkingset &alive = ctx->alive;
+	siphash_ctx sip_ctx = ctx->sip_ctx;
 
-  for (nonce_t block = id * 32; block < HALFSIZE; block += ctx->nthreads * 32) {
-    u32 alive32 = alive.block(block);
-    for (nonce_t nonce = block - 1; alive32;) { // -1 compensates for 1-based ffs
-      u32 ffs = __ffs(alive32);
-      nonce += ffs; alive32 >>= ffs;
-      edge_t edge = make_edge(dipnode(sip_ctx,nonce,0)<<1, dipnode(sip_ctx,nonce,1)<<1|1);
-      for (u32 i = 0; i < ctx->nsols; i++) {
-        noncedge_t *sol = ctx->sols[i];
-        for (u32 j = 0; j < PROOFSIZE; j++) {
-          if (sol[j].edge == edge)
-            sol[j].nonce = nonce;
-        }
-      }
-    }
-  }
+	nonce_t block = id * 64;
+
+	u64 alive64 = alive.wideblock(block);
+	for (nonce_t nonce = block - 1; alive64;) { // -1 compensates for 1-based ffs
+		u64 ffs = __ffsll(alive64);
+		nonce += ffs; alive64 >>= ffs;
+		edge_t edge = make_edge(dipnode(sip_ctx, nonce, 0) << 1, dipnode(sip_ctx, nonce, 1) << 1 | 1);
+		for (u32 i = 0; i < ctx->nsols; i++) {
+			noncedge_t *sol = ctx->sols[i];
+			for (u32 j = 0; j < PROOFSIZE; j++) {
+				if (sol[j].edge == edge)
+					sol[j].nonce = nonce;
+			}
+		}
+	}
 }
 
 int noncedge_cmp(const void *a, const void *b) {
@@ -386,6 +388,7 @@ int main(int argc, char **argv) {
 
   printf("Looking for %d-cycle on cuckoo%d(\"%s\") with 50%% edges, %d trims, %d threads %d per block\n",
                PROOFSIZE, SIZESHIFT, header, ntrims, nthreads, tpb);
+
   u64 edgeBytes = HALFSIZE/8, nodeBytes = TWICE_WORDS*sizeof(u32);
 
   cuckoo_ctx ctx(header, nthreads);
@@ -397,7 +400,7 @@ int main(int argc, char **argv) {
   int edgeUnit=0, nodeUnit=0;
   u64 eb = edgeBytes, nb = nodeBytes;
   for (; eb >= 1024; eb>>=10) edgeUnit++;
-  for (; nb >= 1024; nb>>=10) nodeUnit++;
+  for (; nb >= 1024; nb>>=10) nodeUnit++; 
   printf("Using %d%cB edge and %d%cB node memory.\n",
      (int)eb, " KMGT"[edgeUnit], (int)nb, " KMGT"[nodeUnit]);
 
@@ -421,10 +424,10 @@ int main(int argc, char **argv) {
   assert(bits != 0);
   cudaMemcpy(bits, ctx.alive.bits, (HALFSIZE/64) * sizeof(u64), cudaMemcpyDeviceToHost);
 
-  u32 cnt = 0;
+  u64 cnt = 0;
   for (int i = 0; i < HALFSIZE/64; i++)
     cnt += __builtin_popcountll(~bits[i]);
-  u32 load = (u32)(100L * cnt / CUCKOO_SIZE);
+  u64 load = (u64)(100L * cnt / CUCKOO_SIZE);
   printf("final load %d%%\n", load);
 
   if (load >= 90) {
@@ -440,11 +443,11 @@ int main(int argc, char **argv) {
 
   cudaMemcpy(device_ctx, &ctx, sizeof(cuckoo_ctx), cudaMemcpyHostToDevice);
   
-  find_cycles<<<nthreads/tpb,tpb>>>(device_ctx);
+  find_cycles << <nthreads / tpb, tpb >> >(device_ctx);
   cudaMemcpy(&ctx, device_ctx, sizeof(cuckoo_ctx), cudaMemcpyDeviceToHost);
 
   if (ctx.nsols) {
-    find_nonces<<<nthreads/tpb, tpb>>>(device_ctx);
+	find_nonces << <(HALFSIZE / 64) / tpb, tpb >> >(device_ctx);
     cudaMemcpy(&ctx, device_ctx, sizeof(cuckoo_ctx), cudaMemcpyDeviceToHost);
     for (u32 i = 0; i < ctx.nsols; i++) {
       printf("Solution");
